@@ -269,7 +269,7 @@ def test_flash_attn_output(
         assert (dk - dk_ref).abs().max().item() <= 10 * (dk_pt - dk_ref).abs().max().item()
         assert (dv - dv_ref).abs().max().item() <= 10 * (dv_pt - dv_ref).abs().max().item()
 
-@pytest.mark.parametrize("dtype", [torch.bfloat16])
+@pytest.mark.parametrize("dtype", [torch.float16])
 @pytest.mark.parametrize("causal", [False])
 @pytest.mark.parametrize("d", [128])
 def test_flash_attn_bwd_varlen_v3_midjourney(d, causal, dtype):
@@ -294,10 +294,14 @@ def test_flash_attn_bwd_varlen_v3_midjourney(d, causal, dtype):
     q_cuseqlen = torch.tensor([0, L - num_padding_tokens], device=device, dtype=torch.int32)
     k_cuseqlen = torch.tensor([0, L - num_padding_tokens], device=device, dtype=torch.int32)
 
-    q = torch.randn((1, L, n_heads, head_dim), device="cuda", dtype=torch.bfloat16, requires_grad=True) * 0.1
-    k = torch.randn((1, L, n_heads, head_dim), device="cuda", dtype=torch.bfloat16, requires_grad=True) * 0.1
-    v = torch.randn((1, L, n_heads, head_dim), device="cuda", dtype=torch.bfloat16, requires_grad=True) * 0.1
+    q = torch.randn((1, L, n_heads, head_dim), device="cuda", dtype=dtype, requires_grad=True) * 0.1
+    k = torch.randn((1, L, n_heads, head_dim), device="cuda", dtype=dtype, requires_grad=True) * 0.1
+    v = torch.randn((1, L, n_heads, head_dim), device="cuda", dtype=dtype, requires_grad=True) * 0.1
+    q[:, L-num_padding_tokens:, :, :] = 0
+    k[:, L-num_padding_tokens:, :, :] = 0
+    v[:, L-num_padding_tokens:, :, :] = 0
     g = 0.001 * torch.randint(0, 200, (1, L, n_heads, head_dim), dtype=dtype, device="cuda")
+    g[:, L-num_padding_tokens:, :, :] = 0
     
     q_ref = q.detach().clone().requires_grad_()
     k_ref = k.detach().clone().requires_grad_()
@@ -322,6 +326,9 @@ def test_flash_attn_bwd_varlen_v3_midjourney(d, causal, dtype):
         dk,
         dv,
     ) = torch.autograd.grad(out, (q, k, v), g)
+    dq[L-num_padding_tokens:, :, :] = 0
+    dk[L-num_padding_tokens:, :, :] = 0
+    dv[L-num_padding_tokens:, :, :] = 0
 
     lengths = torch.full((1, 1), L - num_padding_tokens, device = "cuda", dtype=torch.int32)
     padding_mask = repeat(torch.arange(L, device=device), "s -> b s", b=1) < lengths
@@ -343,6 +350,10 @@ def test_flash_attn_bwd_varlen_v3_midjourney(d, causal, dtype):
         dk_ref,
         dv_ref,
     ) = torch.autograd.grad(out_ref, (q_ref, k_ref, v_ref), g_ref)
+    dq_ref[L-num_padding_tokens:, :, :] = 0
+    dk_ref[L-num_padding_tokens:, :, :] = 0
+    dv_ref[L-num_padding_tokens:, :, :] = 0
+
 
     with torch.no_grad():
         print(f"dQ max diff: {(dq - dq_ref.view_as(dq)).abs().max().item()}")
