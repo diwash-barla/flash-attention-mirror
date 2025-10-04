@@ -71,13 +71,17 @@ repeats = 30
 device = 'cuda'
 dtype = torch.float16
 
-bs_seqlen_vals = [(32, 512), (16, 1024), (8, 2048), (4, 4096), (2, 8192), (1, 16384)]
-causal_vals = [False, True]
-headdim_vals = [64, 128]
+#bs_seqlen_vals = [(32, 512), (16, 1024), (8, 2048), (4, 4096), (2, 8192), (1, 16384)]
+bs_seqlen_vals = [(1, 16384)]
+#causal_vals = [False, True]
+causal_vals = [False]
+#headdim_vals = [64, 128]
+headdim_vals = [128]
 dim = 2048
 dropout_p = 0.0
 
-methods = (["Flash2", "Pytorch"]
+#methods = (["Flash2", "Pytorch"]
+methods = (["Flash2"]
            + (["Triton"] if attention_triton is not None else [])
            + (["xformers.c"] if xops is not None else [])
            + (["xformers.f"] if xops is not None else []))
@@ -95,6 +99,7 @@ for causal in causal_vals:
             nheads = dim // headdim
             qkv = torch.randn(batch_size, seqlen, 3, nheads, headdim, device=device, dtype=dtype,
                               requires_grad=True)
+            print(f"benchmark {config=}")
             f, b = time_fwd_bwd(
                 flash_attn_qkvpacked_func, qkv, dropout_p, causal=causal, repeats=repeats, verbose=False
             )

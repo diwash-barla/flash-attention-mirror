@@ -195,6 +195,11 @@ def bwd(
     # get shape
     batch, _, nheads_q, _ = q.shape
 
+    #print("q:", q.shape)
+    #print("k:", k.shape)
+    #print("v:", v.shape)
+    #print("out:", out.shape)
+
     # Upstream change: base seeding logic on provided rng_state instead of dropout probability.
     if rng_state is not None:
         philox_seed, philox_offset = rng_state[0].item(), rng_state[1].item()

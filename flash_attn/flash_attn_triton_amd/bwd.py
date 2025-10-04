@@ -2,6 +2,8 @@ import os
 import torch
 import triton  # type: ignore
 import triton.language as tl  # type: ignore
+from triton.experimental import gluon
+from triton.experimental.gluon import language as gl
 from typing import Literal, Optional
 from .utils import (
     DEBUG,
@@ -644,6 +646,7 @@ def _bwd_fused_atomics_dkdvdq_inner(
     # Ensure step is coprime with num_steps to visit all indices exactly once
     step = 1  # 3 if num_steps > 1 or num_steps==3 else 1 # coprime with num_steps
 
+    tl.assume(num_steps > 1)
     for iter in range(num_steps):
         # Compute the permuted block index
         blk_idx = (start_idx + iter * step) % num_steps
@@ -1691,6 +1694,7 @@ def _bwd_kernel_fused_atomics_dq_causal(
         tl.store(dq_ptr + offs_dq, dq, mask=mask_q)
 
 
+## Triton impl of fa bwd with atomics
 @triton.jit
 def _bwd_kernel_fused_atomics_dkdvdq_noncausal(
     Q,
@@ -1906,6 +1910,118 @@ def _bwd_kernel_fused_atomics_dkdvdq_noncausal(
     tl.store(DV + adj_dkdv, dv, mask=mask_kv)
     dk *= sm_scale
     tl.store(DK + adj_dkdv, dk, mask=mask_kv)
+
+
+## Gluon impl of fa bwd with atomics
+@gluon.jit
+def _bwd_kernel_fused_atomics_dkdvdq_noncausal_gluon(
+    Q,
+    K,
+    V,
+    sm_scale,
+    DO,
+    DK,
+    DV,
+    DQ,
+    M,
+    Delta,
+    stride_qb,
+    stride_qh,
+    stride_qm,
+    stride_qk,
+    stride_kb,
+    stride_kh,
+    stride_kn,
+    stride_kk,
+    stride_vb,
+    stride_vh,
+    stride_vn,
+    stride_vk,
+    stride_dkb,
+    stride_dkh,
+    stride_dkn,
+    stride_dkk,
+    stride_dqb,
+    stride_dqh,
+    stride_dqm,
+    stride_dqk,
+    stride_deltab,
+    stride_deltah,
+    stride_deltam,
+    stride_dob,
+    stride_doh,
+    stride_dom,
+    stride_dok,
+    stride_dropoutb,
+    stride_dropouth,
+    stride_dropoutm,
+    stride_dropoutn,
+    stride_descale_q_z,
+    stride_descale_k_z,
+    stride_descale_v_z,
+    stride_descale_do_z,
+    cu_seqlens_q,
+    cu_seqlens_k,
+    max_seqlen_q,
+    max_seqlen_k,
+    dropout_mask,
+    dropout_p,
+    philox_seed,
+    philox_offset,
+    descale_q_ptr,
+    descale_k_ptr,
+    descale_v_ptr,
+    descale_do_ptr,
+    NUM_Q_HEADS: gl.constexpr,
+    NUM_K_HEADS: gl.constexpr,
+    BATCH,
+    NUM_K_PIDS,
+    BLOCK_M: gl.constexpr,
+    BLOCK_N: gl.constexpr,
+    BLK_SLICE_FACTOR: gl.constexpr,
+    BLOCK_D_MODEL: gl.constexpr,
+    BLOCK_D_MODEL_POW2: gl.constexpr,
+    ENABLE_DROPOUT: gl.constexpr,
+    IS_VARLEN: gl.constexpr,
+    IS_FP8: gl.constexpr,
+    FP8_MAX: gl.constexpr,
+):
+    # workgroup id
+    wid = gl.program_id(0)  # 0, ..., NUM_K_PIDS * BATCH * NUM_K_HEADS - 1
+
+    # Workgroups get launched first along batch dim, then in head_k dim, and then in seq k block dim
+    # This is in order to avoid contention for the tl.atomic_add (inside _bwd_dkdvdq_inner) that happens between workgroups that share the same batch and head_k.
+    bid = wid % BATCH
+    hkid = wid // BATCH % NUM_K_HEADS
+    pid = wid // (BATCH * NUM_K_HEADS) % NUM_K_PIDS
+
+    q_start = 0
+    k_start = 0
+    seqlen_q = max_seqlen_q
+    seqlen_k = max_seqlen_k
+
+
+    layout: gl.constexpr = gl.BlockedLayout([1, 1], [1, 64], [4, 1], [0, 1])
+
+    dk = gl.zeros([BLOCK_N, BLOCK_D_MODEL_POW2], dtype=tl.float32, layout=layout)
+    dv = gl.zeros([BLOCK_N, BLOCK_D_MODEL_POW2], dtype=tl.float32, layout=layout)
+
+    start_n = pid * BLOCK_N
+
+    offs_k = gl.arange(0, BLOCK_D_MODEL_POW2, gl.SliceLayout(0, layout))
+    offs_n = start_n + gl.arange(0, BLOCK_N, gl.SliceLayout(1, layout))
+    mask_kv = offs_n[:, None] < seqlen_k
+
+    adj_dkdv = (
+        bid * stride_dkb
+        + hkid * stride_dkh
+        + k_start * stride_dkn
+        + offs_n[:, None] * stride_dkn
+        + offs_k[None, :] * stride_dkk
+    )
+    gl.store(DV + adj_dkdv, dv, mask=mask_kv)
+    dk *= sm_scale
+    gl.store(DK + adj_dkdv, dk, mask=mask_kv)
 
 
 @triton.jit
@@ -4452,14 +4568,17 @@ def attention_backward_triton_fused_atomics_impl(
         fused
     ):  # fuses dk, dv, dq computations into one kernel by computing the dq using atomic adds between workgroups
 
-        BLOCK_N = (
-            128 if BLOCK_D_MODEL_POW2 < 160 else 64
-        )  # larger head sizes lead to oom
+        ## Change the config here
+        BLOCK_M = 16
+        BLOCK_N = 256
+        #(
+        #    128 if BLOCK_D_MODEL_POW2 < 160 else 64
+        #)  # larger head sizes lead to oom
         config = {
-            "BLOCK_M": 32,
+            "BLOCK_M": BLOCK_M,
             "BLOCK_N": BLOCK_N,
             "num_warps": 4,
-            "num_stages": 1,
+            "num_stages": 2,
             "waves_per_eu": 1,
             "BLK_SLICE_FACTOR": 2,
         }
